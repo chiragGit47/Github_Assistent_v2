@@ -1,13 +1,15 @@
 import json
+from typing import Any
 
 from langchain_core.messages import (
+    AIMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
 from langchain_ollama import ChatOllama
 
-from app.core.exceptions import GitHubAPIError
+from app.core.config import settings
 from app.state.manager import manager
 from app.tools.github_tools import (
     create_repository,
@@ -17,35 +19,85 @@ from app.tools.github_tools import (
     upload_project_zip,
     upload_single_file,
 )
-from app.core.config import settings
 
 
 SYSTEM_PROMPT = """
-You are a GitHub assistant for authenticated users.
+You are a GitHub assistant.
 
-Supported actions:
-1. Fetch GitHub repositories.
-2. Create public or private repositories.
-3. Upload one prepared file using an upload_id.
-4. Upload a prepared ZIP project using an upload_id.
+You help the authenticated user perform supported GitHub operations.
+
+Available actions:
+1. List the user's GitHub repositories.
+2. Create a GitHub repository.
+3. Upload a single file.
+4. Upload a ZIP project.
 5. Generate a LinkedIn post from a repository README.
-6. Generate three resume bullet points from a repository README.
+6. Generate resume bullet points from a repository README.
 
 Rules:
-- Never ask for access tokens, passwords, PATs or OAuth secrets.
-- Never invent repository information.
-- Never invent an upload_id.
-- Use only the tools required by the user's current request.
-- Do not repeat the same tool call.
-- Do not call LinkedIn and resume tools together unless the user asks for both.
-- Do not claim success unless the tool reports success.
-- Keep responses concise.
+- Use the provided tools whenever a request requires GitHub data or an action.
+- Never invent repository names, files, README content, or GitHub results.
+- Do not claim that an action succeeded unless the tool confirms success.
+- Ask for missing required information.
+- Never expose access tokens, API keys, secrets, or internal session data.
+- Do not execute arbitrary scripts or shell commands.
+- Keep responses clear and concise.
 """
 
 
+def create_cloud_llm(temperature: float = 0.2) -> ChatOllama:
+    """
+    Create a ChatOllama client configured for Ollama Cloud.
+    """
+
+    return ChatOllama(
+        model=settings.ollama_model,
+        base_url=settings.ollama_base_url,
+        temperature=temperature,
+        client_kwargs={
+            "headers": {
+                "Authorization": f"Bearer {settings.ollama_api_key}",
+            }
+        },
+    )
+
+
+def normalise_tool_result(result: Any) -> dict[str, Any]:
+    """
+    Convert a tool result into a predictable dictionary.
+    """
+
+    if isinstance(result, dict):
+        return result
+
+    if isinstance(result, str):
+        return {
+            "success": True,
+            "message": result,
+            "data": None,
+        }
+
+    return {
+        "success": True,
+        "message": "Tool completed successfully.",
+        "data": result,
+    }
+
+
+def tool_result_as_text(result: dict[str, Any]) -> str:
+    """
+    Safely serialise a tool result for the LLM.
+    """
+
+    try:
+        return json.dumps(result, default=str)
+    except (TypeError, ValueError):
+        return str(result)
+
+
 class GitHubAgent:
-    def __init__(self):
-        tools = [
+    def __init__(self) -> None:
+        self.tools = [
             fetch_repositories,
             create_repository,
             upload_single_file,
@@ -54,91 +106,142 @@ class GitHubAgent:
             generate_resume_points,
         ]
 
-        self.tools = {
+        self.tools_by_name = {
             tool.name: tool
-            for tool in tools
+            for tool in self.tools
         }
 
-        # Used only to decide which tools to call.
-        self.tool_llm = ChatOllama(
-            model=settings.ollama_model,
-            base_url=settings.ollama_base_url,
-            client_kwargs={
-                "headers": {
-                    "Authorization": (
-                        f"Bearer {settings.ollama_api_key}"
-                    )
-            }
-        },
-        ).bind_tools(tools)
+        # This model decides whether a tool must be called.
+        self.tool_llm = create_cloud_llm(
+            temperature=0.1
+        ).bind_tools(self.tools)
 
-        # Used for the final answer.
-        # It cannot call tools again.
-        self.final_llm = ChatOllama(
-            model="qwen2.5",
-            temperature=0.2,
+        # This model writes the final natural-language answer.
+        self.final_llm = create_cloud_llm(
+            temperature=0.2
         )
 
     async def chat(
         self,
         session_id: str,
-        user_message: str,
-    ) -> dict:
-        session = manager.get(session_id)
-
-        if session is None:
-            return {
-                "success": False,
-                "message": "Session is invalid or expired.",
-                "action": "authentication_required",
-                "data": None,
-                "error": "Invalid session.",
-            }
-
-        messages = session.messages
-
-        if not messages:
-            messages.append(
-                SystemMessage(content=SYSTEM_PROMPT)
-            )
-
-        messages.append(
-            HumanMessage(content=user_message)
-        )
+        message: str,
+    ) -> dict[str, Any]:
+        """
+        Process one chat message for an authenticated session.
+        """
 
         try:
-            response = await self.tool_llm.ainvoke(messages)
+            state = manager.get(session_id)
 
-            # No tool required: return normal conversation.
-            if not response.tool_calls:
-                messages.append(response)
+            if state is None:
+                return {
+                    "success": False,
+                    "message": (
+                        "Your session is missing or expired. "
+                        "Please log in with GitHub again."
+                    ),
+                    "action": "session_expired",
+                    "data": None,
+                    "error": "Session not found",
+                }
 
-                session.messages = messages
-                manager.save(session)
+            if not state.github_access_token:
+                return {
+                    "success": False,
+                    "message": "Please log in with GitHub first.",
+                    "action": "authentication_required",
+                    "data": None,
+                    "error": "GitHub access token is missing",
+                }
+
+            if not message or not message.strip():
+                return {
+                    "success": False,
+                    "message": "Please enter a message.",
+                    "action": "validation_error",
+                    "data": None,
+                    "error": "Message cannot be empty",
+                }
+
+            if not state.messages:
+                state.messages.append(
+                    SystemMessage(content=SYSTEM_PROMPT)
+                )
+
+            state.messages.append(
+                HumanMessage(content=message.strip())
+            )
+
+            first_response = await self.tool_llm.ainvoke(
+                state.messages
+            )
+
+            tool_calls = getattr(
+                first_response,
+                "tool_calls",
+                None,
+            ) or []
+
+            # The model answered without needing a tool.
+            if not tool_calls:
+                state.messages.append(first_response)
+                manager.save(state)
 
                 return {
                     "success": True,
-                    "message": response.content,
-                    "action": "chat",
+                    "message": (
+                        first_response.content
+                        or "Request completed."
+                    ),
+                    "action": "chat_response",
                     "data": None,
                     "error": None,
                 }
 
-            messages.append(response)
+            state.messages.append(first_response)
 
-            executed_calls = set()
-            tool_results = []
-            last_tool_name = None
+            executed_signatures: set[str] = set()
+            completed_results: list[dict[str, Any]] = []
 
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = dict(tool_call.get("args", {}))
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name")
+                tool_call_id = tool_call.get("id")
+                tool_args = dict(
+                    tool_call.get("args") or {}
+                )
 
-                # Backend controls session identity.
+                if not tool_name or tool_name not in self.tools_by_name:
+                    invalid_result = {
+                        "success": False,
+                        "message": (
+                            f"The requested tool "
+                            f"'{tool_name}' is unavailable."
+                        ),
+                        "data": None,
+                        "error": "Unknown tool",
+                    }
+
+                    state.messages.append(
+                        ToolMessage(
+                            content=tool_result_as_text(
+                                invalid_result
+                            ),
+                            tool_call_id=tool_call_id or tool_name or "unknown",
+                        )
+                    )
+
+                    completed_results.append(
+                        {
+                            "tool_name": tool_name,
+                            "result": invalid_result,
+                        }
+                    )
+                    continue
+
+                # Every GitHub tool needs the authenticated session.
                 tool_args["session_id"] = session_id
 
-                # Prevent duplicate tool calls.
-                call_signature = json.dumps(
+                signature = json.dumps(
                     {
                         "name": tool_name,
                         "args": tool_args,
@@ -147,139 +250,153 @@ class GitHubAgent:
                     default=str,
                 )
 
-                if call_signature in executed_calls:
+                if signature in executed_signatures:
+                    duplicate_result = {
+                        "success": False,
+                        "message": (
+                            "Duplicate tool execution was prevented."
+                        ),
+                        "data": None,
+                        "error": "Duplicate tool call",
+                    }
+
+                    state.messages.append(
+                        ToolMessage(
+                            content=tool_result_as_text(
+                                duplicate_result
+                            ),
+                            tool_call_id=tool_call_id or tool_name,
+                        )
+                    )
                     continue
 
-                executed_calls.add(call_signature)
+                executed_signatures.add(signature)
 
-                tool = self.tools.get(tool_name)
+                try:
+                    raw_result = await self.tools_by_name[
+                        tool_name
+                    ].ainvoke(tool_args)
 
-                if tool is None:
+                    result = normalise_tool_result(
+                        raw_result
+                    )
+
+                except Exception as exc:
                     result = {
                         "success": False,
-                        "error": f"Unknown tool: {tool_name}",
-                    }
-                else:
-                    print("TOOL NAME:", tool_name)
-                    print("TOOL ARGS:", tool_args)
-
-                    try:
-                        result = await tool.ainvoke(tool_args)
-
-                    except GitHubAPIError as error:
-                        result = {
-                            "success": False,
-                            "error": error.message,
-                            "status_code": error.status_code,
-                            "details": error.details,
-                        }
-
-                    except Exception as error:
-                        result = {
-                            "success": False,
-                            "error": "Tool execution failed.",
-                            "details": str(error),
-                        }
-
-                    print("TOOL RESULT:", result)
-
-                tool_results.append({
-                    "tool": tool_name,
-                    "result": result,
-                })
-
-                last_tool_name = tool_name
-
-                messages.append(
-                    ToolMessage(
-                        content=json.dumps(
-                            result,
-                            default=str,
+                        "message": (
+                            f"The {tool_name} operation failed."
                         ),
-                        tool_call_id=tool_call["id"],
+                        "data": None,
+                        "error": str(exc),
+                    }
+
+                completed_results.append(
+                    {
+                        "tool_name": tool_name,
+                        "result": result,
+                    }
+                )
+
+                state.messages.append(
+                    ToolMessage(
+                        content=tool_result_as_text(result),
+                        tool_call_id=tool_call_id or tool_name,
                     )
                 )
 
-                # Stop immediately after a failed tool.
-                if result.get("success") is False:
-                    session.messages = messages
-                    manager.save(session)
+                if not result.get("success", True):
+                    manager.save(state)
 
                     return {
                         "success": False,
                         "message": result.get(
-                            "error",
-                            "The requested action failed.",
+                            "message",
+                            "The GitHub operation failed.",
                         ),
-                        "action": tool_name,
-                        "data": result,
-                        "error": (
-                            result.get("details")
-                            or result.get("error")
-                        ),
+                        "action": f"{tool_name}_error",
+                        "data": result.get("data"),
+                        "error": result.get("error"),
                     }
 
-            if not tool_results:
-                return {
-                    "success": False,
-                    "message": "No valid tool was executed.",
-                    "action": "tool_error",
-                    "data": None,
-                    "error": "Duplicate or invalid tool calls.",
-                }
+            # Content-generation tools already return final content.
+            for completed in completed_results:
+                tool_name = completed["tool_name"]
+                result = completed["result"]
 
-            # Content tools already return finished content.
-            if (
-                len(tool_results) == 1
-                and last_tool_name == "generate_linkedin_post"
-            ):
-                result = tool_results[0]["result"]
-                final_message = result["linkedin_post"]
+                if tool_name == "generate_linkedin_post":
+                    content = (
+                        result.get("linkedin_post")
+                        or result.get("data")
+                        or result.get("message")
+                    )
 
-            elif (
-                len(tool_results) == 1
-                and last_tool_name == "generate_resume_points"
-            ):
-                result = tool_results[0]["result"]
+                    state.messages.append(
+                        AIMessage(content=str(content))
+                    )
+                    manager.save(state)
 
-                final_message = "\n".join(
-                    f"• {point}"
-                    for point in result["resume_points"]
-                )
+                    return {
+                        "success": True,
+                        "message": str(content),
+                        "action": "linkedin_post_generated",
+                        "data": result.get("data"),
+                        "error": None,
+                    }
 
-            else:
-                # Normal model summarises results but cannot call tools.
-                final_response = await self.final_llm.ainvoke(
-                    messages
-                )
+                if tool_name == "generate_resume_points":
+                    points = (
+                        result.get("resume_points")
+                        or result.get("data")
+                    )
 
-                final_message = (
-                    final_response.content
-                    or "Request completed successfully."
-                )
+                    if isinstance(points, list):
+                        content = "\n".join(
+                            f"• {point}"
+                            for point in points
+                        )
+                    else:
+                        content = str(
+                            points
+                            or result.get("message")
+                            or "Resume points generated."
+                        )
 
-                messages.append(final_response)
+                    state.messages.append(
+                        AIMessage(content=content)
+                    )
+                    manager.save(state)
 
-            session.messages = messages
-            manager.save(session)
+                    return {
+                        "success": True,
+                        "message": content,
+                        "action": "resume_points_generated",
+                        "data": result.get("data"),
+                        "error": None,
+                    }
 
-            final_data = (
-                tool_results[0]["result"]
-                if len(tool_results) == 1
-                else tool_results
+            final_response = await self.final_llm.ainvoke(
+                state.messages
             )
+
+            state.messages.append(final_response)
+            manager.save(state)
 
             return {
                 "success": True,
-                "message": final_message,
-                "action": last_tool_name or "chat",
-                "data": final_data,
+                "message": (
+                    final_response.content
+                    or "The operation completed successfully."
+                ),
+                "action": "github_action_completed",
+                "data": [
+                    completed["result"]
+                    for completed in completed_results
+                ],
                 "error": None,
             }
 
-        except Exception as error:
-            print("AGENT ERROR:", repr(error))
-
+        except Exception as exc:
             return {
                 "success": False,
                 "message": (
@@ -288,7 +405,7 @@ class GitHubAgent:
                 ),
                 "action": "chat_error",
                 "data": None,
-                "error": str(error),
+                "error": str(exc),
             }
 
 

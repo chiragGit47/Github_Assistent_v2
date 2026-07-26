@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
     ollama_api_key: str
     ollama_base_url: str = "https://ollama.com"
-    ollama_model: str
+    ollama_model: str = "gpt-oss:20b"
 
     model_config = SettingsConfigDict(
         env_file=".env",
