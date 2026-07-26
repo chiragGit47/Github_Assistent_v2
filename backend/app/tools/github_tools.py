@@ -12,10 +12,13 @@ from app.services.content_service import content_service
 from app.services.github_service import github_service
 from app.services.temp_file_service import temp_file_service
 from app.state.manager import manager
+from typing import Annotated
+
+from langchain_core.tools import InjectedToolArg, tool
 
 
 @tool
-async def fetch_repositories(session_id: str) -> dict:
+async def fetch_repositories(session_id: Annotated[str, InjectedToolArg],) -> dict:
     """Fetch repositories accessible to the authenticated GitHub user."""
 
     session = manager.get(session_id)
@@ -52,7 +55,7 @@ async def fetch_repositories(session_id: str) -> dict:
 
 @tool
 async def create_repository(
-    session_id: str,
+    session_id: Annotated[str, InjectedToolArg],
     repo_name: str,
     private: bool = False,
 ) -> dict:
@@ -94,7 +97,7 @@ async def create_repository(
 
 @tool
 async def upload_single_file(
-    session_id: str,
+    session_id: Annotated[str, InjectedToolArg],
     repo_name: str,
     upload_id: str,
     destination_path: str,
@@ -167,7 +170,7 @@ async def upload_single_file(
 
 @tool
 async def upload_project_zip(
-    session_id: str,
+    session_id: Annotated[str, InjectedToolArg],
     repo_name: str,
     upload_id: str,
     commit_message: str = "Upload project using GitHub Assistant",
@@ -232,7 +235,7 @@ async def upload_project_zip(
 
 @tool
 async def generate_linkedin_post(
-    session_id: str,
+    session_id: Annotated[str, InjectedToolArg],
     repo_name: str,
 ) -> dict:
     """Generate a LinkedIn post from a repository README file."""
@@ -268,7 +271,7 @@ async def generate_linkedin_post(
 
 @tool
 async def generate_resume_points(
-    session_id: str,
+    session_id: Annotated[str, InjectedToolArg],
     repo_name: str,
 ) -> dict:
     """Generate resume bullet points from a repository README file."""
