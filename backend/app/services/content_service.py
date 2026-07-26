@@ -1,5 +1,6 @@
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
+from app.core.config import settings
 
 
 MAX_README_CHARS = 10000
@@ -8,9 +9,16 @@ MAX_README_CHARS = 10000
 class ContentService:
     def __init__(self):
         self.llm = ChatOllama(
-            model="qwen2.5:3b",
-            temperature=0.3,
-        )
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            client_kwargs={
+                "headers": {
+                "Authorization": (
+                f"Bearer {settings.ollama_api_key}"
+                )
+            }
+        },
+    )
 
     def _trim_readme(self, readme_content: str) -> str:
         content = readme_content.strip()

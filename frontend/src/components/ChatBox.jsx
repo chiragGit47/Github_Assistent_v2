@@ -205,25 +205,28 @@ function ChatBox({ sessionId }) {
         </div>
       )}
 
-      <div className="messages">
+        <div className="messages">
         {messages.map((message, index) => (
-          <Message
+            <Message
             key={`${message.role}-${index}`}
             role={message.role}
             content={message.content}
-          />
+            action={message.action}
+            data={message.data}
+            />
         ))}
 
         {loading && (
-        <Message
-        key={`${message.role}-${index}`}
-        role={message.role}
-        content={message.content}
-        action={message.action}
-        data={message.data}
-      />
+            <Message
+            role="assistant"
+            content={
+                preparedUpload
+                ? "Uploading your file..."
+                : "Processing your request..."
+            }
+            />
         )}
-      </div>
+        </div>
 
       <form onSubmit={handleSubmit}>
         <input

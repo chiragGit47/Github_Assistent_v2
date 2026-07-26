@@ -17,6 +17,7 @@ from app.tools.github_tools import (
     upload_project_zip,
     upload_single_file,
 )
+from app.core.config import settings
 
 
 SYSTEM_PROMPT = """
@@ -60,8 +61,15 @@ class GitHubAgent:
 
         # Used only to decide which tools to call.
         self.tool_llm = ChatOllama(
-            model="qwen2.5",
-            temperature=0.1,
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            client_kwargs={
+                "headers": {
+                    "Authorization": (
+                        f"Bearer {settings.ollama_api_key}"
+                    )
+            }
+        },
         ).bind_tools(tools)
 
         # Used for the final answer.
