@@ -19,8 +19,8 @@ async def chat(request: ChatRequest):
     get_valid_session(request.session_id)
 
     result = await github_agent.chat(
-        session_id=request.session_id,
-        user_message=request.message,
-    )
+    session_id=request.session_id,
+    message=request.message,
+)
 
     return ChatResponse(**result)
