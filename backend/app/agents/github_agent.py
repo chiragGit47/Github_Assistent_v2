@@ -18,6 +18,7 @@ from app.tools.github_tools import (
     generate_resume_points,
     upload_project_zip,
     upload_single_file,
+    generate_resume_points,
 )
 
 
@@ -108,6 +109,7 @@ class GitHubAgent:
             upload_single_file,
             upload_project_zip,
             generate_linkedin_post,
+            generate_resume_points,
             generate_resume_points,
         ]
 

@@ -16,6 +16,14 @@ from typing import Annotated
 
 from langchain_core.tools import InjectedToolArg, tool
 
+import base64
+from typing import Annotated
+
+import httpx
+from langchain_core.tools import InjectedToolArg, tool
+
+from app.state.manager import manager
+
 
 @tool
 async def fetch_repositories(session_id: Annotated[str, InjectedToolArg],) -> dict:
@@ -333,11 +341,34 @@ async def generate_resume_points(
 
     session = manager.get(session_id)
 
+    readme_result = await read_repository_readme.ainvoke(
+    {
+        "repo_name": repo_name,
+        "session_id": session_id,
+        }
+    )
+    
+    if not readme_result.get("success"):
+        return readme_result
+
+    readme_content = (
+    readme_result.get("data", {}).get("content", "")
+    )
+
     if session is None:
         return {
             "success": False,
             "error": "Session is invalid or expired.",
         }
+    
+    linkedin_post = await content_service.generate_linkedin_post(
+    repo_name=repo_name,
+    readme_content=readme_content,
+    repo_url=(
+        f"https://github.com/"
+        f"{session.username}/{repo_name}"
+    ),
+)
 
     readme = await github_service.read_file(
         access_token=session.github_access_token,
@@ -357,4 +388,188 @@ async def generate_resume_points(
         "success": True,
         "repo_name": repo_name.strip(),
         "resume_points": points,
+    }
+
+
+@tool
+async def read_repository_readme(
+    repo_name: str,
+    session_id: Annotated[str, InjectedToolArg],
+) -> dict:
+    """
+    Find and return the README content from one of the authenticated
+    user's GitHub repositories.
+
+    Use this tool when the user asks to find, read, display, summarise,
+    or inspect a repository README.
+    """
+
+    state = manager.get(session_id)
+
+    if state is None:
+        return {
+            "success": False,
+            "message": "Your session has expired. Please log in again.",
+            "action": "session_expired",
+            "data": None,
+            "error": "Session not found",
+        }
+
+    if not state.github_access_token:
+        return {
+            "success": False,
+            "message": "GitHub authentication is required.",
+            "action": "authentication_required",
+            "data": None,
+            "error": "GitHub access token is missing",
+        }
+
+    if not state.username:
+        return {
+            "success": False,
+            "message": "GitHub username is missing from the session.",
+            "action": "user_not_found",
+            "data": None,
+            "error": "GitHub username is missing",
+        }
+
+    readme_filenames = [
+        "README.md",
+        "README.MD",
+        "README",
+        "README.txt",
+        "Readme.md",
+        "readme.md",
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {state.github_access_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for filename in readme_filenames:
+            url = (
+                f"https://api.github.com/repos/"
+                f"{state.username}/{repo_name}/contents/{filename}"
+            )
+
+            response = await client.get(
+                url,
+                headers=headers,
+            )
+
+            if response.status_code == 404:
+                continue
+
+            if response.status_code == 401:
+                return {
+                    "success": False,
+                    "message": (
+                        "Your GitHub authentication has expired. "
+                        "Please log in again."
+                    ),
+                    "action": "authentication_expired",
+                    "data": None,
+                    "error": "GitHub returned 401",
+                }
+
+            if response.status_code == 403:
+                return {
+                    "success": False,
+                    "message": (
+                        "GitHub denied access to this repository "
+                        "or the API rate limit was reached."
+                    ),
+                    "action": "github_access_denied",
+                    "data": None,
+                    "error": response.text,
+                }
+
+            if response.status_code != 200:
+                return {
+                    "success": False,
+                    "message": (
+                        f"GitHub could not read '{filename}' "
+                        f"from '{repo_name}'."
+                    ),
+                    "action": "readme_fetch_failed",
+                    "data": None,
+                    "error": response.text,
+                }
+
+            payload = response.json()
+
+            encoded_content = payload.get("content", "")
+            encoding = payload.get("encoding")
+
+            if not encoded_content:
+                return {
+                    "success": False,
+                    "message": (
+                        f"The README file in '{repo_name}' is empty."
+                    ),
+                    "action": "readme_empty",
+                    "data": None,
+                    "error": "README content is empty",
+                }
+
+            if encoding != "base64":
+                return {
+                    "success": False,
+                    "message": (
+                        "The README uses an unsupported encoding."
+                    ),
+                    "action": "unsupported_encoding",
+                    "data": None,
+                    "error": f"Encoding: {encoding}",
+                }
+
+            try:
+                readme_content = base64.b64decode(
+                    encoded_content
+                ).decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "message": (
+                        "The README was found but could not be decoded."
+                    ),
+                    "action": "readme_decode_failed",
+                    "data": None,
+                    "error": str(exc),
+                }
+
+            return {
+                "success": True,
+                "message": readme_content,
+                "action": "readme_found",
+                "data": {
+                    "repo_name": repo_name,
+                    "owner": state.username,
+                    "filename": filename,
+                    "content": readme_content,
+                    "html_url": payload.get("html_url"),
+                    "download_url": payload.get("download_url"),
+                    "size": payload.get("size"),
+                },
+                "error": None,
+            }
+
+    return {
+        "success": False,
+        "message": (
+            f"No README file was found in the root of "
+            f"'{repo_name}'."
+        ),
+        "action": "readme_not_found",
+        "data": {
+            "repo_name": repo_name,
+            "checked_filenames": readme_filenames,
+        },
+        "error": "README not found",
     }
