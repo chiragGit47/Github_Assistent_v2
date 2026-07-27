@@ -16,9 +16,9 @@ from app.tools.github_tools import (
     fetch_repositories,
     generate_linkedin_post,
     generate_resume_points,
+    read_repository_readme,
     upload_project_zip,
     upload_single_file,
-    generate_resume_points,
 )
 
 
@@ -34,6 +34,7 @@ Available actions:
 4. Upload a ZIP project.
 5. Generate a LinkedIn post from a repository README.
 6. Generate resume bullet points from a repository README.
+7. Find and display the raw README content from a repository.
 
 Important authentication rules:
 - The user is already authenticated through GitHub OAuth.
@@ -48,6 +49,11 @@ Rules:
 - Do not claim that an action succeeded unless the tool confirms success.
 - Do not execute arbitrary scripts or shell commands.
 - Keep responses clear and concise.
+- When the user asks to find, read, view, show, inspect, or display a README,
+  immediately call the read_repository_readme tool.
+- You can retrieve and show raw README content using the
+  read_repository_readme tool.
+- Never say that README retrieval is unavailable when this tool is present.
 """
 
 
@@ -104,14 +110,14 @@ def tool_result_as_text(result: dict[str, Any]) -> str:
 class GitHubAgent:
     def __init__(self) -> None:
         self.tools = [
-            fetch_repositories,
-            create_repository,
-            upload_single_file,
-            upload_project_zip,
-            generate_linkedin_post,
-            generate_resume_points,
-            generate_resume_points,
-        ]
+    fetch_repositories,
+    create_repository,
+    upload_single_file,
+    upload_project_zip,
+    read_repository_readme,
+    generate_linkedin_post,
+    generate_resume_points,
+]
 
         self.tools_by_name = {
             tool.name: tool
@@ -330,6 +336,26 @@ class GitHubAgent:
             for completed in completed_results:
                 tool_name = completed["tool_name"]
                 result = completed["result"]
+
+                if tool_name == "read_repository_readme":
+                    readme_data = result.get("data") or {}
+                    readme_content = readme_data.get("content", "")
+                    filename = readme_data.get("filename", "README")
+
+                    content = f"{filename}\n\n{readme_content}"
+
+                    state.messages.append(
+                        AIMessage(content=content)
+                    )
+                    manager.save(state)
+
+                    return {
+                        "success": True,
+                        "message": content,
+                        "action": "readme_found",
+                        "data": readme_data,
+                        "error": None,
+                    }
 
                 if tool_name == "generate_linkedin_post":
                     content = (
