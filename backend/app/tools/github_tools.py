@@ -235,38 +235,93 @@ async def upload_project_zip(
 
 @tool
 async def generate_linkedin_post(
-    session_id: Annotated[str, InjectedToolArg],
     repo_name: str,
+    session_id: Annotated[str, InjectedToolArg],
 ) -> dict:
-    """Generate a LinkedIn post from a repository README file."""
+    """
+    Generate a LinkedIn post from the authenticated user's
+    GitHub repository README.
+    """
 
-    session = manager.get(session_id)
+    state = manager.get(session_id)
 
-    if session is None:
+    if state is None or not state.github_access_token:
         return {
             "success": False,
-            "error": "Session is invalid or expired.",
+            "message": "Your session has expired. Please log in again.",
+            "data": None,
+            "error": "Missing GitHub session",
         }
 
-    readme = await github_service.read_file(
-        access_token=session.github_access_token,
-        owner=session.username,
-        repo_name=repo_name.strip(),
-        file_path="README.md",
-    )
+    try:
+        readme_result = await github_service.get_readme(
+            access_token=state.github_access_token,
+            owner=state.username,
+            repo_name=repo_name,
+        )
 
-    post = await content_service.generate_linkedin_post(
-        readme["content"]
-    )
+        if not readme_result:
+            return {
+                "success": False,
+                "message": (
+                    f"No README was found in the repository "
+                    f"'{repo_name}'."
+                ),
+                "data": None,
+                "error": "README not found",
+            }
 
-    session.current_repo = repo_name.strip()
-    manager.save(session)
+        if isinstance(readme_result, dict):
+            readme_content = (
+                readme_result.get("content")
+                or readme_result.get("readme_content")
+                or ""
+            )
+        else:
+            readme_content = str(readme_result)
 
-    return {
-        "success": True,
-        "repo_name": repo_name.strip(),
-        "linkedin_post": post,
-    }
+        if not readme_content.strip():
+            return {
+                "success": False,
+                "message": (
+                    f"The README in '{repo_name}' is empty."
+                ),
+                "data": None,
+                "error": "README content is empty",
+            }
+
+        repo_url = (
+            f"https://github.com/{state.username}/{repo_name}"
+        )
+
+        linkedin_post = (
+            await content_service.generate_linkedin_post(
+                repo_name=repo_name,
+                readme_content=readme_content,
+                repo_url=repo_url,
+            )
+        )
+
+        return {
+            "success": True,
+            "message": "LinkedIn post generated successfully.",
+            "linkedin_post": linkedin_post,
+            "data": {
+                "repo_name": repo_name,
+                "repo_url": repo_url,
+            },
+            "error": None,
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": (
+                "The generate_linkedin_post operation failed."
+            ),
+            "data": None,
+            "error": str(exc),
+        }
 
 
 @tool
